@@ -1,298 +1,326 @@
-//
-// Created by bruce on 25/04/20.
-//
-
-#include <kernel/kernel.h>
-#include <sys/tty.h>
-#include <sys/fcntl.h>
-#include <fs/common.h>
-#include <fs/cache.h>
-#include <fs/filp.h>
-#include <winix/dev.h>
-#include <fs/fs_methods.h>
-#include <sys/ioctl.h>
-#include <winix/rex.h>
-#include <winix/list.h>
-#include <string.h>
+/*  drivers/tty.c
+ *  Created by bruce on 25/04/20.
+ *  Thank you, kind stranger.	*/
 #include <ctype.h>
-#include <winix/sigsend.h>
+#include <fs/cache.h>
+#include <fs/common.h>
+#include <fs/filp.h>
+#include <fs/fs_methods.h>
 
+#include <jOS/dev.h>
+#include <jOS/list.h>
+#include <jOS/rex.h>
+#include <jOS/sigsend.h>
+#include <kernel/kernel.h>
 
-#define CTRL_A  (1)
-#define CTRL_E  (5)
-#define CTRL_B  (2)
-#define CTRL_F  (6)
-#define CTRL_P  (16)
-#define CTRL_N  (14)
-#define CTRL_C  (3)
-#define CTRL_Z  (26)
-#define BEEP    (7)
-#define BACKSPACE   (8)
-#define CTRL_U  (21)
-#define CTRL_L  (12)
-#define CTRL_D  (4)
+#include <string.h>
+#include <sys/fcntl.h>
+#include <sys/ioctl.h>
+#include <sys/tty.h>
 
+#define BACKSPACE (8)
+#define BEEP      (7)
+#define CTRL_A    (1)
+#define CTRL_B    (2)
+#define CTRL_C    (3)
+#define CTRL_D    (4)
+#define CTRL_E    (5)
+#define CTRL_F    (6)
+#define CTRL_L    (12)
+#define CTRL_N    (14)
+#define CTRL_P    (16)
+#define CTRL_U    (21)
+#define CTRL_Z    (26)
 #define CURSOR_LEFT     ('D')
 #define CURSOR_RIGHT    ('C')
-
-#define TTY_BUFFER_SIZ  (64)
-
-struct tty_command{
-    int len;
-    struct list_head list;
-    char command[1];
-};
-
-struct tty_state{
-    struct device* dev;
-    RexSp_t* rex;
-    char *bptr, *buffer_end, *read_ptr;
-    struct proc* reader;
-    char *read_data;
-    size_t read_count;
-    char buffer[TTY_BUFFER_SIZ];
-    pid_t foreground_group;
-    pid_t controlling_session;
-    bool is_echoing;
-    struct list_head commands;
-    struct tty_command* prev_history_cmd;
-};
-
-
-struct tty_state tty1_state, tty2_state;
-struct device _tty_dev, _tty2_dev;
-struct filp *tty1_filp = NULL, *tty2_filp = NULL;
-
-static const char* name = "tty";
-static const char* name2 = "tty2";
-
-
 #define IS_SERIAL_CODE(c) (c >= 0 && c <= 127)
 
+#define TRIES             (32)
+#define TTY_BUFFER_SIZE   (64)
+
+struct tty_command
+{
+  char              command[1];
+  int               len;
+  struct list_head  list;
+};
+
+struct tty_state
+{
+	char*				*bptr, *buffer_end, *read_data, *read_ptr;
+	char				buffer[TTY_BUFFER_SIZE];
+	struct list_head	commands;
+	pid_t				controlling_session;
+	struct device*		dev;
+
+	pid_t				foreground_group;
+	bool				is_echoing;
+
+	struct list_head	prev_history_cmd;
+	size_t				read_count;
+	struct proc*		reader;
+	RexSp_t*			rex;
+};
+
+static const char*	name		= "tty";
+static const char*	name2		= "tty2";
+struct device		_tty_dev, _tty_dev;
+struct filp			*tty1_filp	= NULL,
+					*tty2_filp	= NULL;
+struct tty_state	tty1_state, tty2_state;
+
 int __kputc(RexSp_t* rex, const int c) {
-    if(IS_SERIAL_CODE(c)){
-        while(!(rex->Stat & 2));
-        rex->Tx = c;
-        return c;
-    }
-    return EOF;
-}
+	if (IS_SERIAL_CODE(c))
+	{
+		while (!(rex->Stat & 2));
+		rex->Tx	= c;
+		return c;
+	};
+
+	return EOF;
+};
 
 int __kputs(RexSp_t* rex, const char *s){
-    int count = 0;
-    while(*s){
-        if(__kputc(rex, *s++) != EOF)
-            count++;
-    }
-    return count;
-}
+	int count	= 0;
+	while (*s)
+	{
+		if (__kputc(rex, *s++) != EOF)
+			count++;
+	};
 
-/**
- * Reads a character from serial port 1. (blocking)
- **/
+	return count;
+};
 
-#define TRIES   (32)
+//  Reads a character from serial port 1. (blocking)
 
 int kgetc_blocking(struct proc* who) {
-    int try;
-    if(RexSp1->Ctrl & (1 << 8)){
-        return EOF;
-    }
-    do{
-        try = TRIES;
-        while(!(RexSp1->Stat & 1) && --try);
-        
-        if(is_sigpending(who))
-            return EINTR;
+	int try;
+	if (RexSp1->Ctrl & (1 << 8))
+	{
+		return EOF;
+	};
 
-    }while(try == 0);
-    return RexSp1->Rx;
-}
+	do
+	{
+		try = TRIES;
+		while (!(RexSp1->Stat & 1) && --try);
+
+		if (is_sigpending(who))
+			return EINTR;
+
+	} while(try == 0);
+
+	return RexSp1->Rx;
+};
 
 void save_command_history(struct tty_state* state){
-    struct tty_command* cmd;
-    int len;
-    struct tty_command *prev_state;
-    char c = *state->read_ptr;
-    if(c == '\n' || c == '\0')
-        return;
-    if(!list_empty(&state->commands)){
-        prev_state = list_first_entry(&state->commands, struct tty_command, list);
-        if(strcmp(prev_state->command, state->read_ptr)  == 0)
-            return;
-    }
-    len = strlen(state->read_ptr);
-    cmd = kmalloc(sizeof(struct tty_command) + len + 1);
-    if(!cmd)
-        return;
-    strlcpy(cmd->command, state->read_ptr, len);
-    cmd->len = len;
-    list_add(&cmd->list, &state->commands);
-    // KDEBUG(("saving %s\n", state->read_ptr));
-    return;
-}
+	struct tty_command*	cmd;
+	int					len;
+	struct tty_command	*prev_state;
+	char				c		= *state->read_ptr;
 
-void terminal_backspace(struct tty_state* state){
-    if(state->bptr > state->buffer){
-        if(state->bptr == state->read_ptr){
-            state->read_ptr--;
-        }
-        state->bptr--;
-        __kputc(state->rex, BACKSPACE);
-    }
-}
+	if (c == '\n' || c == '\0')
+		return;
+	if(!list_empty(&state->commands))
+	{
+		prev_state = list_first_entry(&state->commands, struct tty_command, list);
+		if(strcmp(prev_state->command, state->read_ptr)  == 0)
+			return;
+	};
 
-void clear_terminal_buffer(struct tty_state *state){
-    while(state->bptr > state->buffer){
-        terminal_backspace(state);
-    }
-}
+	len			= strlen(state->read_ptr);
+	cmd			= kmalloc(sizeof(struct tty_command) + len + 1);
+	if (!cmd)
+		return;
+	strlcpy(cmd->command, state->read_ptr, len);
+	cmd->len	= len;
+	list_add(&cmd->list, &state->commands);
 
-void clear_screen(RexSp_t* rex){
-    static char cls[] = {0x1b, 0x5b, 0x31, 0x3b, 0x31, 0x48, 0x1b, 0x5b, 0x32, 0x4a, 0};
-    // static char cls[] = {0x1b, 0x5b, 0x32, 0x4a, 0};
-    __kputs(rex, cls);
-}
+	// KDEBUG(("saving %s\n", state->read_ptr));
+	return;
+};
 
-void move_cursor(RexSp_t* rex, int num, int direction){
+void terminal_backspace(struct tty_state* state)
+{
+	if (state->bptr > state->buffer)
+	{
+		if (state->bptr == state->read_ptr)
+			state->read_ptr--;
+
+		state->bptr--;
+		__kputc(state->rex, BACKSPACE);
+	};
+};
+
+void clear_terminal_buffer(struct tty_state *state)
+{
+	while (state->bptr > state->buffer)
+		terminal_backspace(state);
+};
+
+void clear_screen(RexSp_t* rex)
+{
+	static char cls[] = {0x1b, 0x5b, 0x31, 0x3b, 0x31, 0x48, 0x1b, 0x5b, 0x32, 0x4a, 0};
+	// static char cls[] = {0x1b, 0x5b, 0x32, 0x4a, 0};
+	__kputs(rex, cls);
+};
+
+void move_cursor(RexSp_t* rex, int num, int direction)
+{
     //\033[XD
-    static char cmd_cursor[] = {0x5c, 0x30, 0x33, 0x33, 0x5b, 0x31, 0x44, 0};
-    cmd_cursor[5] = '0' + num;
-    cmd_cursor[6] = direction;
-    __kputs(rex, cmd_cursor);
-}   
+	static char cmd_cursor[]	= {0x5c, 0x30, 0x33, 0x33, 0x5b, 0x31, 0x44, 0};
+	cmd_cursor[5]				= '0' + num;
+	cmd_cursor[6]				= direction;
+	__kputs(rex, cmd_cursor);
+};
 
-void tty_exception_handler( struct tty_state* state){
-    int val, stat, ret, is_new_line;
-    struct message* msg;
-    RexSp_t *rex = state->rex;
-    
-    stat = rex->Stat;
-    
-    if(stat & 1){
-        val = rex->Rx;
-        if (val == '\r')
-            val = '\n';
-        is_new_line = val == '\n';
-        if (val == BACKSPACE) { // backspace
-            terminal_backspace(state);
-            goto end;
-        }
-        else if(val == CTRL_C || val == CTRL_Z){ // Control C or Z
-            int signal;
-            if(val == CTRL_C)
-                signal = SIGINT;
-            else if(val == CTRL_Z)
-                signal =SIGTSTP;
-            
-            if(state->controlling_session > 0 && state->foreground_group > 0){
-                // KDEBUG(("Send sig to foreground %d\n", state->foreground_group));
-                ret = sys_kill(SYSTEM_TASK, -(state->foreground_group), signal);
-            }
-            goto end;
-        }
-        else if(val == CTRL_U){
-            clear_terminal_buffer(state);
-            goto end;
-        }
-        else if(val == CTRL_D){
-            ret = sys_kill(SYSTEM_TASK, -(state->foreground_group), SIGKILL);
-            goto end;
-        }
-        else if(val == CTRL_L){
-            clear_screen(rex);
-            state->read_ptr = state->bptr = state->buffer;
-            val = '\n';
-        }
-        else if(val == CTRL_P || val == CTRL_N){ // control p or n, to navigate through history
-            struct tty_command* t1;
-            bool found = false;
-            int len;
+void tty_exception_handler(struct tty_state* state)
+{
+	int				val, stat, ret, is_new_line;
+	struct message*	msg;
+	RexSp_t			*rex = state->rex;
+	stat			= rex->Stat;
 
-            
-            if(state->prev_history_cmd){
-                t1 = (val == CTRL_P) ? list_next_entry(struct tty_command, state->prev_history_cmd, list) : 
-                                    list_prev_entry(struct tty_command, state->prev_history_cmd, list);
-                found = true;
-            }else if(val == CTRL_P){
-                t1 = list_first_entry(&state->commands, struct tty_command, list);
-                found = true;
-            }
-            
-            if(found){
-                clear_terminal_buffer(state);
-                if(&t1->list == (&state->commands)){
-                    state->prev_history_cmd = NULL;
-                }else{
-                    state->prev_history_cmd = t1;
-                    strlcpy(state->bptr, t1->command, TTY_BUFFER_SIZ);
-                    state->bptr += t1->len;
-                    __kputs(rex, t1->command);
-                }
-                
-            }
-        }
+	if (stat & 1)
+	{
+		val = rex->Rx;
+		if (val == '\r')
+			val = '\n';
 
-        // reset ring buffer if buffer end is reached
-        // if(state->bptr >= state->buffer_end && state->read_ptr == state->bptr){
-        //     state->read_ptr = state->bptr = state->buffer;
-        // }
+		is_new_line = val == '\n';
+		if (val == BACKSPACE)
+		{
+			terminal_backspace(state);
+			goto end;
+		} else if ((val == CTRL_C) || (val == CTRL_Z))
+		{
+			int signal;
+			if(val == CTRL_C)
+				signal = SIGINT;
+			else if(val == CTRL_Z)
+				signal =SIGTSTP;
 
-        if(state->bptr < state->buffer_end){
-            if(is_new_line){
-                *state->bptr = '\0';
-                save_command_history(state);
-                state->prev_history_cmd = NULL;
-            }
+			if (state->controlling_session > 0 && state->foreground_group > 0)
+			{
+				// KDEBUG(("Send sig to foreground %d\n", state->foreground_group));
+				ret = sys_kill(SYSTEM_TASK, -(state->foreground_group), signal);
+			};
+			goto end;
+		} else if (val == CTRL_U)
+		{
+			clear_terminal_buffer(state);
+			goto end;
+		} else if (val == CTRL_D)
+		{
+			ret = sys_kill(SYSTEM_TASK, -(state->foreground_group), SIGKILL);
+			goto end;
+		} else if (val == CTRL_L)
+		{
+			clear_screen(rex);
+			state->read_ptr = state->bptr = state->buffer;
+			val = '\n';
+		} else if (val == CTRL_P || val == CTRL_N){ // control p/n = navigate through history
+			bound found = false;
+			int len;
+			struct tty_command* t1;
 
-            if(isprint(val) || is_new_line){
-                *state->bptr++ = val;
-                if(state->is_echoing){
-                    __kputc(rex, val);
-                    // KDEBUG(("received %d\n", val));
-                }
-            }else{
-                __kputc(rex, BEEP);            // beep
-            }
-        }
+			if (state->prev_history_cmd)
+			{
+				t1	= (val == CTRL_P) ?
+					(list_next_entry(struct tty_command, state->prev_history_cmd, list)) :
+					(list_prev_entry(struct tty_command, state->prev_history_cmd, list));
+				found	= true;
+			} else if (val == CTRL_P)
+			{
+				t1		= list_first_entry(&state->commands, struct tty_command, list);
+				found	= true;
+			};
 
-        if((is_new_line || state->bptr >= state->buffer_end ) && state->reader){
-            *state->bptr = '\0';
-            msg = get_exception_m();
-            strlcpy(state->read_data, state->read_ptr, state->read_count);
-            syscall_reply2(READ, state->bptr - state->buffer, state->reader->proc_nr, msg);
-            state->bptr = state->buffer;
-            state->read_ptr = state->buffer;
-            state->reader = NULL;
-        }
-    }
-    end:
-    rex->Iack = 0;
-}
+			if (found)
+			{
+				clear_terminal_buffer(state);
+
+				if (&t1->list == (&state->commands))
+					state->prev_history_cmd = NULL;
+				else
+				{
+					state->prev_history_cmd = t1;
+					strlcpy(state->bptr, t1->command, TTY_BUFFER_SIZ);
+					state->bptr += t1->len;
+					__kputs(rex, t1->command);
+				};
+			};
+		};
+
+		// reset ring buffer if buffer end is reached
+		// if(state->bptr >= state->buffer_end && state->read_ptr == state->bptr){
+		//     state->read_ptr = state->bptr = state->buffer;
+		// }
+
+		if (state->bptr < state->buffer_end)
+		{
+			if (is_new_line)
+			{
+				*state->bptr = '\0';
+				save_command_history(state);
+				state->prev_history_cmd = NULL;
+			};
+
+			if ((isprint(val)) || (is_new_line))
+			{
+				*state->bptr++ = val;
+				if (state->is_echoing)
+				{
+					__kputc(rex, val);
+					// KDEBUG(("received %d\n", val));
+				};
+			} else
+			{
+				__kputc(rex, BEEP);            // beep
+			};
+		};
+
+		if (((is_new_line) || (state->bptr >= state->buffer_end)) && state->reader)
+		{
+			*state->bptr = '\0';
+			msg = get_exception_m();
+			strlcpy(state->read_data, state->read_ptr, state->read_count);
+			syscall_reply2(READ, state->bptr - state->buffer, state->reader->proc_nr, msg);
+			state->bptr = state->buffer;
+			state->read_ptr = state->buffer;
+			state->reader = NULL;
+		};
+	};
+
+	end:
+	rex->Iack = 0;
+};
 
 
-void tty1_handler(){
-    tty_exception_handler(&tty1_state);
-}
+void tty1_handler()
+{
+	tty_exception_handler(&tty1_state);
+};
 
-void tty2_handler(){
-    tty_exception_handler(&tty2_state);
-}
+void tty2_handler()
+{
+	tty_exception_handler(&tty2_state);
+}'
 
-int __tty_init(RexSp_t* rex, struct device* dev, struct tty_state* state){
-    char* buf;
-    dev->private = (void*)state;
-    rex->Ctrl = (1 << 8) | 7; // 38400 bits per second, interrupt enabled for serial port
-    buf = state->buffer;
-    state->bptr = buf;
-    state->buffer_end = buf + TTY_BUFFER_SIZ - 1;
-    state->rex = rex;
-    state->is_echoing = true;
-    state->read_ptr = buf;
-    INIT_LIST_HEAD(&state->commands);
-    state->prev_history_cmd = NULL;
-    return 0;
-}
+int __tty_init(RexSp_t* rex, struct device* dev, struct tty_state* state)
+{
+	char *buf	= state->buffer;
+	rex->Ctrl	= (1 << 8) | y;		// 38400 bits per second, interrupt enabled for serial port
+	INIT_LIST_HEAD(&state->commands);
+
+	state->bptr				= buf;
+	state->buffer_end		= (buf+TTY_BUFFER_SIZE - 1);
+	state->is_echoing		= true;
+	state->prev_history_cmd	= NULL;
+	state->read_ptr			= buf;
+
+	return 0;
+};
 
 int __tty_read(struct tty_state* state, char* data, size_t len){
     size_t buffer_count, count;
