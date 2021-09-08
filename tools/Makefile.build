@@ -1,0 +1,76 @@
+# SPDX-License-Identifier: GPL-2.0
+# ==========================================================================
+# Building
+# ==========================================================================
+
+
+src := $(obj)
+srcdepend := $(src)/.depend
+
+# Init all relevant variables used in kbuild files so
+# 1) they have correct type
+# 2) they do not inherit any value from the environment
+obj-y :=
+asm-y :=
+srec-y :=
+srecobj :=
+objects :=
+assembly :=
+source :=
+targets :=
+subdir-y :=
+
+-include $(src)/Makefile
+include tools/Kbuild.include
+
+# The filename Kbuild has precedence over Makefile
+
+subdir-y := $(addprefix $(src)/, $(patsubst %/,%, $(filter %/,$(obj-y))))
+obj-y := $(filter-out %/,$(obj-y))
+
+objects := $(addprefix $(src)/, $(obj-y) $(asm-y:%.s=%.o))
+assembly := $(addprefix $(src)/, $(obj-y:%.o=%.s))
+source := $(addprefix $(src)/, $(obj-y:%.o=%.c))
+srecobj := $(srec-y)
+# srecobj := $(addprefix $(SREC_INCLUDE)/, $(srec-y))
+srecobj := $(addprefix $(src)/, $(srec-y))
+# srecdep := $(foreach dep, $(srec-y), $(addprefix $(src)/, $($(dep))) )
+
+
+PHONY := __build 
+
+
+__build: $(assembly) $(objects) $(srcdepend) $(subdir-y) $(srecobj) 
+$(assembly): %.s: %.c 
+	$(Q)wcc $(CFLAGS) -S -N -I./include/posix_include -I./include -o $@ $<
+ifeq ($(KBUILD_VERBOSE),0)
+	@echo "CC \t $<"
+endif
+
+$(objects): %.o: %.s
+	$(Q)wasm $< -o $@
+ifeq ($(KBUILD_VERBOSE),0)
+	@echo "AS \t $<"
+endif
+
+$(srcdepend): $(source) $(includes)
+	$(Q)makedepend -o.s -f- -I./include/posix_include -I./include $(source) > $(srcdepend)
+
+$(subdir-y): FORCE
+	$(Q)$(MAKE) $(build)=$@
+
+.SECONDEXPANSION:
+%.srec : $$(%.srec)
+	$(Q)wlink -Ttext $(TEXT_OFFSET) -v -o $@ $^ $(shell $(get_libs) $^) > $(SREC_INCLUDE)/$(notdir $(@:.srec=)).verbose
+	$(Q)cp $@ $(SREC_INCLUDE)/$(notdir $@)
+ifeq ($(KBUILD_VERBOSE),0)
+	@echo "LD \t $@"
+endif
+
+FORCE:
+
+.DELETE_ON_ERROR:
+-include $(src)/.depend
+
+
+
